@@ -3,11 +3,15 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"time"
+
+	"github.com/maruel/panicparse/stack"
 
 	"github.com/go-chi/chi/middleware"
 )
@@ -15,18 +19,28 @@ import (
 var (
 	// LogEntryCtxKey is the context.Context key to store the request log entry.
 	LogEntryCtxKey = &contextKey{"LogEntry"}
+	// PanicEntryCtxKey is the context.Context key to store the request panic entry.
+	PanicEntryCtxKey = &contextKey{"PanicEntry"}
+
+	// DefaultLoggerExtensionsIgnore is the default request extensions to ignores
+	DefaultLoggerExtensionsIgnore = StringsToExtensions("css", "js", "jpg", "png", "gif", "ico", "ttf", "woff2")
+
+	DefaultRequestLogFormatter = &DefaultLogAndPanicFormatter{
+		Logger:      log.New(os.Stdout, "", log.LstdFlags),
+		PanicLogger: log.New(os.Stderr, "", log.LstdFlags),
+	}
 
 	// DefaultLogger is called by the Logger middleware handler to log each request.
 	// Its made a package-level variable so that it can be reconfigured for custom
 	// logging configurations.
-	DefaultLogger = RequestLogger(&DefaultLogFormatter{Logger: log.New(os.Stdout, "", log.LstdFlags), NoColor: false})
+	DefaultLogger = RequestLogger(DefaultRequestLogFormatter)
 )
 
 // Logger is a middleware that logs the start and end of each request, along
 // with some useful data about what was requested, what the response status was,
 // and how long it took to return. When standard output is a TTY, Logger will
 // print in color, otherwise it will print in black and white. Logger prints a
-// request ID if one is provided.
+// request BID if one is provided.
 //
 // Alternatively, look at https://github.com/pressly/lg and the `lg.RequestLogger`
 // middleware pkg.
@@ -55,24 +69,47 @@ func RequestLogger(f LogFormatter) func(next http.Handler) http.Handler {
 	}
 }
 
+// PanicFormatter initiates the beginning of a new PanicEntry per request.
+// See DefaultLogAndPanicFormatter for an example implementation.
+type PanicFormatter interface {
+	NewPanicEntry(r *http.Request) PanicEntry
+}
+
 // LogFormatter initiates the beginning of a new LogEntry per request.
-// See DefaultLogFormatter for an example implementation.
+// See DefaultLogAndPanicFormatter for an example implementation.
 type LogFormatter interface {
 	NewLogEntry(r *http.Request) LogEntry
 	Accept(r *http.Request) bool
+}
+
+type LogAndPanicFormatter interface {
+	LogFormatter
+	PanicFormatter
 }
 
 // LogEntry records the final log when a request completes.
 // See defaultLogEntry for an example implementation.
 type LogEntry interface {
 	Write(status, bytes int, elapsed time.Duration)
-	Panic(v interface{}, stack []byte)
 	WithLogger(logger LoggerInterface) LogEntry
+}
+
+// PanicEntry records the final log when a request failed.
+// See defaultPanicEntry for an example implementation.
+type PanicEntry interface {
+	Write(v interface{}, stack []byte)
+	WithLogger(logger LoggerInterface) PanicEntry
 }
 
 // GetLogEntry returns the in-context LogEntry for a request.
 func GetLogEntry(r *http.Request) LogEntry {
 	entry, _ := r.Context().Value(LogEntryCtxKey).(LogEntry)
+	return entry
+}
+
+// GetLogEntry returns the in-context LogEntry for a request.
+func GetPanicEntry(r *http.Request) PanicEntry {
+	entry, _ := r.Context().Value(PanicEntryCtxKey).(PanicEntry)
 	return entry
 }
 
@@ -82,21 +119,33 @@ func WithLogEntry(r *http.Request, entry LogEntry) *http.Request {
 	return r
 }
 
+func NewLogEntry(r *http.Request) LogEntry {
+	return DefaultRequestLogFormatter.NewLogEntry(r)
+}
+
+func NewPanicEntry(r *http.Request) PanicEntry {
+	return DefaultRequestLogFormatter.NewPanicEntry(r)
+}
+
+func Accept(r *http.Request) bool {
+	return DefaultRequestLogFormatter.Accept(r)
+}
+
 // LoggerInterface accepts printing to stdlib logger or compatible logger.
 type LoggerInterface interface {
 	Print(v ...interface{})
 }
 
-// DefaultLogFormatter is a simple logger that implements a LogFormatter.
-type DefaultLogFormatter struct {
-	Logger           LoggerInterface
-	NoColor          bool
-	IgnoreExtensions map[string]bool
-	TruncateUri      int
-	NoColorTtyCheck  bool
+// DefaultLogAndPanicFormatter is a simple logger that implements a LogFormatter.
+type DefaultLogAndPanicFormatter struct {
+	Logger, PanicLogger LoggerInterface
+	NoColor             bool
+	IgnoreExtensions    Extensions
+	TruncateUri         int
+	NoColorTtyCheck     bool
 }
 
-func (l *DefaultLogFormatter) Accept(r *http.Request) bool {
+func (l *DefaultLogAndPanicFormatter) Accept(r *http.Request) bool {
 	if l.IgnoreExtensions != nil {
 		if ext := path.Ext(r.URL.Path); ext != "" {
 			return !l.IgnoreExtensions[ext[1:]]
@@ -106,13 +155,16 @@ func (l *DefaultLogFormatter) Accept(r *http.Request) bool {
 }
 
 // NewLogEntry creates a new LogEntry for the request.
-func (l *DefaultLogFormatter) NewLogEntry(r *http.Request) LogEntry {
+func (l *DefaultLogAndPanicFormatter) NewLogEntry(r *http.Request) LogEntry {
 	useColor := !l.NoColor
 	entry := &defaultLogEntry{
-		DefaultLogFormatter: l,
-		request:             r,
-		buf:                 &bytes.Buffer{},
-		useColor:            useColor,
+		baseLogEntry{
+			DefaultLogAndPanicFormatter: l,
+			logger:                      l.Logger,
+			request:                     r,
+			buf:                         &bytes.Buffer{},
+			useColor:                    useColor,
+		},
 	}
 
 	reqID := middleware.GetReqID(r.Context())
@@ -145,19 +197,63 @@ func (l *DefaultLogFormatter) NewLogEntry(r *http.Request) LogEntry {
 	return entry
 }
 
-type defaultLogEntry struct {
-	*DefaultLogFormatter
-	request  *http.Request
-	buf      *bytes.Buffer
-	useColor bool
+// NewPanicEntry creates a new LogEntry for the request panic.
+func (l *DefaultLogAndPanicFormatter) NewPanicEntry(r *http.Request) PanicEntry {
+	useColor := !l.NoColor
+	entry := &defaultPanicEntry{
+		baseLogEntry{
+			DefaultLogAndPanicFormatter: l,
+			logger:                      l.PanicLogger,
+			request:                     r,
+			buf:                         &bytes.Buffer{},
+			useColor:                    useColor,
+		},
+	}
+
+	reqID := middleware.GetReqID(r.Context())
+
+	var cW = ColorWriteTtyCheck
+	if l.NoColorTtyCheck {
+		cW = ColorWrite
+	}
+
+	if reqID != "" {
+		cW(entry.buf, useColor, nYellow, "[%s] ", reqID)
+	}
+	cW(entry.buf, useColor, nCyan, "\"")
+	cW(entry.buf, useColor, bMagenta, "%s ", r.Method)
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	cW(entry.buf, useColor, nCyan, "%s://%s%s %s\" ", scheme, r.Host, r.RequestURI, r.Proto)
+
+	entry.buf.WriteString("from ")
+	entry.buf.WriteString(r.RemoteAddr)
+	entry.buf.WriteString(" - ")
+
+	return entry
 }
 
-func (l *defaultLogEntry) ColorWriter() ColorWriterFunc {
+type baseLogEntry struct {
+	*DefaultLogAndPanicFormatter
+	logger                    LoggerInterface
+	request                   *http.Request
+	buf                       *bytes.Buffer
+	useColor, fullUrl, panics bool
+}
+
+func (l *baseLogEntry) ColorWriter() ColorWriterFunc {
 	var cW = ColorWriteTtyCheck
 	if l.NoColorTtyCheck {
 		cW = ColorWrite
 	}
 	return cW
+}
+
+type defaultLogEntry struct {
+	baseLogEntry
 }
 
 func (l *defaultLogEntry) Write(status, bytes int, elapsed time.Duration) {
@@ -190,16 +286,62 @@ func (l *defaultLogEntry) Write(status, bytes int, elapsed time.Duration) {
 	l.Logger.Print(time.Now().Format(time.RFC3339Nano), l.buf.String())
 }
 
-func (l *defaultLogEntry) Panic(v interface{}, stack []byte) {
-	panicEntry := l.NewLogEntry(l.request).(*defaultLogEntry)
+type defaultPanicEntry struct {
+	baseLogEntry
+}
+
+func (l *defaultPanicEntry) Write(v interface{}, stackb []byte) {
+	panicEntry := l.DefaultLogAndPanicFormatter.NewPanicEntry(l.request).(*defaultPanicEntry)
+	panicEntry.fullUrl = true
 	l.ColorWriter()(panicEntry.buf, l.useColor, bRed, "panic: %+v", v)
-	l.Logger.Print(time.Now().Format(time.RFC3339Nano), panicEntry.buf.String())
-	l.Logger.Print(string(stack))
+	lgr := l.PanicLogger
+	if lgr == nil {
+		lgr = l.Logger
+	}
+	lgr.Print(time.Now().Format(time.RFC3339Nano), panicEntry.buf.String())
+	var out bytes.Buffer
+	c, err := stack.ParseDump(bytes.NewReader(stackb), &out, false)
+	if err != nil {
+		lgr.Print(string(stackb))
+	} else {
+		buckets := stack.Aggregate(c.Goroutines, stack.AnyValue)
+		if err := StackWriteToConsole(&out, &defaultStackPalette, buckets, false, true, nil, nil); err == nil {
+			lgr.Print(out.String())
+		} else {
+			lgr.Print(string(stackb))
+		}
+	}
+}
+
+func (this defaultPanicEntry) WithLogger(logger LoggerInterface) PanicEntry {
+	fmtr := *this.DefaultLogAndPanicFormatter
+	fmtr.Logger = logger
+	this.DefaultLogAndPanicFormatter = &fmtr
+	return &this
+}
+
+func StackWriteToConsole(out io.Writer, p *StackPalette, buckets []*stack.Bucket, fullPath, needsEnv bool, filter, match *regexp.Regexp) error {
+	if needsEnv {
+		_, _ = io.WriteString(out, "\nTo see all goroutines, visit https://github.com/maruel/panicparse#gotraceback\n\n")
+	}
+	srcLen, pkgLen := CalcLengths(buckets, fullPath)
+	for _, bucket := range buckets {
+		header := p.BucketHeader(bucket, fullPath, len(buckets) > 1)
+		if filter != nil && filter.MatchString(header) {
+			continue
+		}
+		if match != nil && !match.MatchString(header) {
+			continue
+		}
+		_, _ = io.WriteString(out, header)
+		_, _ = io.WriteString(out, p.StackLines(&bucket.Signature, srcLen, pkgLen, fullPath))
+	}
+	return nil
 }
 
 func (l defaultLogEntry) WithLogger(logger LoggerInterface) LogEntry {
-	fmtr := *l.DefaultLogFormatter
+	fmtr := *l.DefaultLogAndPanicFormatter
 	fmtr.Logger = logger
-	l.DefaultLogFormatter = &fmtr
+	l.DefaultLogAndPanicFormatter = &fmtr
 	return &l
 }
