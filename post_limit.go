@@ -7,9 +7,8 @@ import (
 )
 
 var (
-	PostSizeKey = contextKey{"post-size"}
-
-	MaxPostSize int64 = 1024 * 1024 // 1Mb
+	PostSizeKey       = contextKey{"post-size"}
+	MaxPostSize int64 = 1024 * 1024 * 10 // 10Mb
 )
 
 type FormParser func(r *http.Request) (err error)
@@ -26,7 +25,7 @@ func ParseForm(r *http.Request) (err error) {
 	case "application/x-www-form-urlencoded":
 		err = r.ParseForm()
 	case "multipart/form-data":
-		err = r.ParseMultipartForm(maxPostSize)
+		err = r.ParseMultipartForm(int64(maxPostSize))
 	default:
 		err = errors.New("bad content-type")
 	}

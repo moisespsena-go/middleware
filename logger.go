@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/maruel/panicparse/stack"
@@ -23,11 +24,12 @@ var (
 	PanicEntryCtxKey = &contextKey{"PanicEntry"}
 
 	// DefaultLoggerExtensionsIgnore is the default request extensions to ignores
-	DefaultLoggerExtensionsIgnore = StringsToExtensions("css", "js", "jpg", "png", "gif", "ico", "ttf", "woff2")
+	DefaultLoggerExtensionsIgnore = StringsToExtensions("css", "js", "jpg", "png", "gif", "ico", "ttf", "woff2", "svg", "svgz")
 
 	DefaultRequestLogFormatter = &DefaultLogAndPanicFormatter{
-		Logger:      log.New(os.Stdout, "", log.LstdFlags),
-		PanicLogger: log.New(os.Stderr, "", log.LstdFlags),
+		Logger:           log.New(os.Stdout, "", log.LstdFlags),
+		PanicLogger:      log.New(os.Stderr, "", log.LstdFlags),
+		IgnoreExtensions: DefaultLoggerExtensionsIgnore,
 	}
 
 	// DefaultLogger is called by the Logger middleware handler to log each request.
@@ -154,6 +156,59 @@ func (l *DefaultLogAndPanicFormatter) Accept(r *http.Request) bool {
 	return true
 }
 
+func LoggerPrintRequestMessage(cW func(w io.Writer, useColor bool, color []byte, s string, args ...interface{}), useColor bool, maxUriLen int, w io.Writer, r *http.Request) {
+	reqID := middleware.GetReqID(r.Context())
+	w.Write([]byte("«" + strings.Split(r.RemoteAddr, ":")[0]))
+
+	if reqID != "" {
+		cW(w, useColor, nYellow, " [%s]", reqID)
+	}
+
+	w.Write([]byte("» "))
+	cW(w, useColor, nCyan, "\"")
+	cW(w, useColor, bMagenta, "%s ", r.Method)
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+
+	uri := r.RequestURI
+	if maxUriLen > 0 && len(uri) > maxUriLen+4 {
+		uri = uri[0:maxUriLen] + " ..."
+	}
+	cW(w, useColor, nCyan, "%s://%s%s %s\" ", scheme, r.Host, r.RequestURI, r.Proto)
+}
+
+func LoggerPrintResponseMessage(cW func(w io.Writer, useColor bool, color []byte, s string, args ...interface{}), useColor bool, w io.Writer, status, bytes int, elapsed time.Duration) {
+	w.Write([]byte("→ \""))
+
+	switch {
+	case status < 200:
+		cW(w, useColor, bBlue, "%03d", status)
+	case status < 300:
+		cW(w, useColor, bGreen, "%03d", status)
+	case status < 400:
+		cW(w, useColor, bCyan, "%03d", status)
+	case status < 500:
+		cW(w, useColor, bYellow, "%03d", status)
+	default:
+		cW(w, useColor, bRed, "%03d", status)
+	}
+
+	cW(w, useColor, bBlue, " %dB ", bytes)
+
+	if elapsed < 500*time.Millisecond {
+		cW(w, useColor, nGreen, "%s", elapsed)
+	} else if elapsed < 5*time.Second {
+		cW(w, useColor, nYellow, "%s", elapsed)
+	} else {
+		cW(w, useColor, nRed, "%s", elapsed)
+	}
+
+	w.Write([]byte("\""))
+}
+
 // NewLogEntry creates a new LogEntry for the request.
 func (l *DefaultLogAndPanicFormatter) NewLogEntry(r *http.Request) LogEntry {
 	useColor := !l.NoColor
@@ -167,32 +222,12 @@ func (l *DefaultLogAndPanicFormatter) NewLogEntry(r *http.Request) LogEntry {
 		},
 	}
 
-	reqID := middleware.GetReqID(r.Context())
-
 	var cW = ColorWriteTtyCheck
 	if l.NoColorTtyCheck {
 		cW = ColorWrite
 	}
 
-	if reqID != "" {
-		cW(entry.buf, useColor, nYellow, "[%s] ", reqID)
-	}
-	cW(entry.buf, useColor, nCyan, "\"")
-	cW(entry.buf, useColor, bMagenta, "%s ", r.Method)
-
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	uri := r.RequestURI
-	if l.TruncateUri > 0 && len(uri) > l.TruncateUri+4 {
-		uri = uri[0:l.TruncateUri] + " ..."
-	}
-	cW(entry.buf, useColor, nCyan, "%s://%s%s %s\" ", scheme, r.Host, uri, r.Proto)
-
-	entry.buf.WriteString("from ")
-	entry.buf.WriteString(r.RemoteAddr)
-	entry.buf.WriteString(" - ")
+	LoggerPrintRequestMessage(cW, useColor, l.TruncateUri, entry.buf, r)
 
 	return entry
 }
@@ -210,29 +245,12 @@ func (l *DefaultLogAndPanicFormatter) NewPanicEntry(r *http.Request) PanicEntry 
 		},
 	}
 
-	reqID := middleware.GetReqID(r.Context())
-
 	var cW = ColorWriteTtyCheck
 	if l.NoColorTtyCheck {
 		cW = ColorWrite
 	}
 
-	if reqID != "" {
-		cW(entry.buf, useColor, nYellow, "[%s] ", reqID)
-	}
-	cW(entry.buf, useColor, nCyan, "\"")
-	cW(entry.buf, useColor, bMagenta, "%s ", r.Method)
-
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	cW(entry.buf, useColor, nCyan, "%s://%s%s %s\" ", scheme, r.Host, r.RequestURI, r.Proto)
-
-	entry.buf.WriteString("from ")
-	entry.buf.WriteString(r.RemoteAddr)
-	entry.buf.WriteString(" - ")
-
+	LoggerPrintRequestMessage(cW, useColor, l.TruncateUri, entry.buf, r)
 	return entry
 }
 
@@ -257,33 +275,8 @@ type defaultLogEntry struct {
 }
 
 func (l *defaultLogEntry) Write(status, bytes int, elapsed time.Duration) {
-	var cW = l.ColorWriter()
-
-	switch {
-	case status < 200:
-		cW(l.buf, l.useColor, bBlue, "%03d", status)
-	case status < 300:
-		cW(l.buf, l.useColor, bGreen, "%03d", status)
-	case status < 400:
-		cW(l.buf, l.useColor, bCyan, "%03d", status)
-	case status < 500:
-		cW(l.buf, l.useColor, bYellow, "%03d", status)
-	default:
-		cW(l.buf, l.useColor, bRed, "%03d", status)
-	}
-
-	cW(l.buf, l.useColor, bBlue, " %dB", bytes)
-
-	l.buf.WriteString(" in ")
-	if elapsed < 500*time.Millisecond {
-		cW(l.buf, l.useColor, nGreen, "%s", elapsed)
-	} else if elapsed < 5*time.Second {
-		cW(l.buf, l.useColor, nYellow, "%s", elapsed)
-	} else {
-		cW(l.buf, l.useColor, nRed, "%s", elapsed)
-	}
-
-	l.Logger.Print(time.Now().Format(time.RFC3339Nano), l.buf.String())
+	LoggerPrintResponseMessage(l.ColorWriter(), l.useColor, l.buf, status, bytes, elapsed)
+	l.Logger.Print(l.buf.String())
 }
 
 type defaultPanicEntry struct {
@@ -298,7 +291,6 @@ func (l *defaultPanicEntry) Write(v interface{}, stackb []byte) {
 	if lgr == nil {
 		lgr = l.Logger
 	}
-	lgr.Print(time.Now().Format(time.RFC3339Nano), panicEntry.buf.String())
 	var out bytes.Buffer
 	c, err := stack.ParseDump(bytes.NewReader(stackb), &out, false)
 	if err != nil {
@@ -306,11 +298,12 @@ func (l *defaultPanicEntry) Write(v interface{}, stackb []byte) {
 	} else {
 		buckets := stack.Aggregate(c.Goroutines, stack.AnyValue)
 		if err := StackWriteToConsole(&out, &defaultStackPalette, buckets, false, true, nil, nil); err == nil {
-			lgr.Print(out.String())
+			panicEntry.buf.Write(out.Bytes())
 		} else {
-			lgr.Print(string(stackb))
+			panicEntry.buf.Write(stackb)
 		}
 	}
+	lgr.Print(panicEntry.buf.String())
 }
 
 func (this defaultPanicEntry) WithLogger(logger LoggerInterface) PanicEntry {

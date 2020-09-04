@@ -8,6 +8,8 @@ import (
 	"runtime/debug"
 
 	"github.com/moisespsena-go/tracederror"
+
+	error_utils "github.com/unapu-go/error-utils"
 )
 
 // Recoverer is a middleware that recovers from panics, logs the panic (and a
@@ -33,12 +35,23 @@ func Recoverer(f ...PanicFormatter) func(next http.Handler) http.Handler {
 							break
 						}
 					}
-					if te, ok := rvr.(tracederror.TracedError); ok {
-						recovererPanic(te.Error(), te.Trace())
-						panicEntry.Write(te.Error(), te.Trace())
+					if err, ok := rvr.(error); ok {
+						var trace = error_utils.TraceOf(err)
+						if trace != nil {
+							recovererPanic(err, trace)
+							panicEntry.Write(err, trace)
+						} else {
+							recovererPanic(err, debug.Stack())
+							panicEntry.Write(err, debug.Stack())
+						}
 					} else {
-						recovererPanic(rvr, debug.Stack())
-						panicEntry.Write(rvr, debug.Stack())
+						if te, ok := rvr.(tracederror.TracedError); ok {
+							recovererPanic(te.Error(), te.Trace())
+							panicEntry.Write(te.Error(), te.Trace())
+						} else {
+							recovererPanic(rvr, debug.Stack())
+							panicEntry.Write(rvr, debug.Stack())
+						}
 					}
 				}
 			}()
