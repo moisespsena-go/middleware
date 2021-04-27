@@ -5,16 +5,18 @@ import (
 	"context"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/maruel/panicparse/stack"
 
 	"github.com/go-chi/chi/middleware"
+
+	"github.com/moisespsena-go/httpu/helpers"
 )
 
 var (
@@ -158,13 +160,16 @@ func (l *DefaultLogAndPanicFormatter) Accept(r *http.Request) bool {
 
 func LoggerPrintRequestMessage(cW func(w io.Writer, useColor bool, color []byte, s string, args ...interface{}), useColor bool, maxUriLen int, w io.Writer, r *http.Request) {
 	reqID := middleware.GetReqID(r.Context())
-	w.Write([]byte("«" + strings.Split(r.RemoteAddr, ":")[0]))
-
+	host, _, _ := net.SplitHostPort(helpers.ReadUserIP(r))
+	if host != "" {
+		w.Write([]byte("«" + host))
+	}
 	if reqID != "" {
 		cW(w, useColor, nYellow, " [%s]", reqID)
 	}
-
-	w.Write([]byte("» "))
+	if host != "" {
+		w.Write([]byte("» "))
+	}
 	cW(w, useColor, nCyan, "\"")
 	cW(w, useColor, bMagenta, "%s ", r.Method)
 
