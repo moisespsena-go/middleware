@@ -12,9 +12,8 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/maruel/panicparse/stack"
-
 	"github.com/go-chi/chi/middleware"
+	"github.com/maruel/panicparse/stack"
 
 	"github.com/moisespsena-go/httpu/helpers"
 )
@@ -26,19 +25,33 @@ var (
 	PanicEntryCtxKey = &contextKey{"PanicEntry"}
 
 	// DefaultLoggerExtensionsIgnore is the default request extensions to ignores
-	DefaultLoggerExtensionsIgnore = StringsToExtensions("css", "js", "jpg", "png", "gif", "ico", "ttf", "woff2", "svg", "svgz")
+	DefaultLoggerExtensionsIgnore = StringsToExtensions(
+		"css", "js", "jpg", "png",
+		"gif", "ico", "ttf", "woff2",
+		"svg", "svgz", "map", "jpeg")
 
-	DefaultRequestLogFormatter = &DefaultLogAndPanicFormatter{
-		Logger:           log.New(os.Stdout, "", log.LstdFlags),
-		PanicLogger:      log.New(os.Stderr, "", log.LstdFlags),
-		IgnoreExtensions: DefaultLoggerExtensionsIgnore,
-	}
+	DefaultRequestLogFormatter = NewDefaultRequestLogFormatter(os.Stdout, os.Stderr, "")
 
 	// DefaultLogger is called by the Logger middleware handler to log each request.
 	// Its made a package-level variable so that it can be reconfigured for custom
 	// logging configurations.
 	DefaultLogger = RequestLogger(DefaultRequestLogFormatter)
 )
+
+// NewDefaultRequestLogFormatter create request logger using default config
+func NewDefaultRequestLogFormatter(out, err io.Writer, prefix string, ignore ...Extensions) *DefaultLogAndPanicFormatter {
+	var ignoreExts Extensions
+	if len(ignore) == 0 {
+		ignoreExts = DefaultLoggerExtensionsIgnore
+	} else {
+		ignoreExts.Update(ignore...)
+	}
+	return &DefaultLogAndPanicFormatter{
+		Logger:           log.New(out, prefix, log.LstdFlags),
+		PanicLogger:      log.New(err, prefix, log.LstdFlags),
+		IgnoreExtensions: ignoreExts,
+	}
+}
 
 // Logger is a middleware that logs the start and end of each request, along
 // with some useful data about what was requested, what the response status was,
@@ -57,12 +70,15 @@ func RequestLogger(f LogFormatter) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(w http.ResponseWriter, r *http.Request) {
 			if f.Accept(r) {
-				entry := f.NewLogEntry(r)
-				ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-
-				t1 := time.Now()
+				var (
+					entry = f.NewLogEntry(r)
+					ww    = middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+					t1    = time.Now()
+				)
 				defer func() {
-					entry.Write(ww.Status(), ww.BytesWritten(), time.Since(t1))
+					if ww.Status() > 0 {
+						entry.Write(ww.Status(), ww.BytesWritten(), time.Since(t1))
+					}
 				}()
 				next.ServeHTTP(ww, WithLogEntry(r, entry))
 			} else {

@@ -4,6 +4,7 @@ package middleware
 // https://github.com/zenazn/goji/tree/master/web/middleware
 
 import (
+	"fmt"
 	"net/http"
 	"runtime/debug"
 
@@ -21,12 +22,16 @@ func Recoverer(f ...PanicFormatter) func(next http.Handler) http.Handler {
 		gpe = f.NewPanicEntry
 		break
 	}
+
 	return func(next http.Handler) http.Handler {
 		fn := func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if rvr := recover(); rvr != nil {
-					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-					var panicEntry PanicEntry
+					var (
+						errb []byte
+						panicEntry PanicEntry
+					)
+
 					for _, gpe := range []func(r *http.Request) PanicEntry{gpe, GetPanicEntry, NewPanicEntry} {
 						if gpe == nil {
 							continue
@@ -36,22 +41,29 @@ func Recoverer(f ...PanicFormatter) func(next http.Handler) http.Handler {
 						}
 					}
 					if err, ok := rvr.(error); ok {
-						var trace = error_utils.TraceOf(err)
-						if trace != nil {
-							recovererPanic(err, trace)
-							panicEntry.Write(err, trace)
-						} else {
-							recovererPanic(err, debug.Stack())
-							panicEntry.Write(err, debug.Stack())
+						errb = error_utils.TraceOf(err)
+						if len(errb) == 0 {
+							errb = debug.Stack()
 						}
 					} else {
 						if te, ok := rvr.(tracederror.TracedError); ok {
-							recovererPanic(te.Error(), te.Trace())
-							panicEntry.Write(te.Error(), te.Trace())
+							errb = te.Trace()
 						} else {
-							recovererPanic(rvr, debug.Stack())
-							panicEntry.Write(rvr, debug.Stack())
+							errb = debug.Stack()
 						}
+					}
+
+					var msg = http.StatusText(http.StatusInternalServerError)
+					if len(errb) > 0 {
+						msg = fmt.Sprintf("<pre>%s\n%s\n\n%s</pre>", msg, fmt.Sprint(rvr), string(errb))
+					}
+					http.Error(w, msg, http.StatusInternalServerError)
+
+					if len(errb) > 0 {
+						go func() {
+							recovererPanic(rvr, errb)
+							panicEntry.Write(rvr, errb)
+						}()
 					}
 				}
 			}()
